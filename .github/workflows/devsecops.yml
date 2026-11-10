@@ -1,0 +1,109 @@
+name: DevSecOps
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Quét secret trong toàn bộ lịch sử git
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # 2. SAST: phân tích mã nguồn Python và JS
+  sast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v5
+      - run: semgrep scan --config p/python --config p/flask --config p/javascript --sarif --output semgrep.sarif --error
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+  # 3. SCA + IaC: thư viện có CVE và lỗi cấu hình Dockerfile
+  sca-iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aquasecurity/trivy-action@v0.36.0   # ghim SHA, xem Bước 5
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+  # 4. Unit test
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r backend/requirements.txt pytest
+      - run: pytest -q
+        working-directory: backend
+  # 5. Build và quét từng image
+  image-scan:
+    needs: [secrets, sast, sca-iac, test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t shortlink-${{ matrix.service }}:${{ github.sha }} ${{ matrix.service }}
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: shortlink-${{ matrix.service }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+  # 6. DAST: chạy app thật rồi tấn công thử bằng OWASP ZAP
+  dast:
+    needs: image-scan
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker compose up -d --build
+      - name: Chờ app sẵn sàng
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/api/health && exit 0
+            sleep 2
+          done
+          docker compose logs && exit 1
+      - name: ZAP baseline scan
+        run: |
+          chmod 777 .
+          docker run --rm --network host -v "$PWD":/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8080 -r zap-report.html -I
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: zap-report.html
+  # 7. Deploy production, dừng chờ người duyệt
+  deploy:
+    needs: dast
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "Deploy ${{ github.sha }} lên production"
